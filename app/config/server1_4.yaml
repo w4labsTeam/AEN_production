@@ -1,0 +1,18 @@
+server:
+  name: "server_1_4"
+  host: "0.0.0.0"
+  port: 8000
+
+tanks:
+  ids: [1, 2, 3, 4]
+
+cameras:
+  urls:
+    - "rtsp://AENadmin:AENcamera123@192.168.0.61:554/12"
+    - "rtsp://AENadmin:AENcamera123@192.168.0.62:554/11"
+    - "rtsp://AENadmin:AENcamera123@192.168.0.63:554/12"
+    - "rtsp://AENadmin:AENcamera123@192.168.0.64:554/12"
+
+modbus:
+  plc_ip: "192.168.0.2"
+  plc_port: 510
