@@ -1,32 +1,45 @@
+
 import subprocess
 import numpy as np
 import threading
 import time
 from collections import deque
-from app.services.modbus_service import modbus_queue
-import cv2   
 
 WIDTH = 640
 HEIGHT = 480
-FRAME_SIZE = WIDTH * HEIGHT * 3  # 3 bytes per pixel for BGR format
+FRAME_SIZE = WIDTH * HEIGHT * 3
+
+# Camera acquisition settings
+CAPTURE_INTERVAL = 60       
+RETRY_INTERVAL = 10          
+FFMPEG_TIMEOUT = 20          
+CAMERA_START_OFFSET = 2     
 
 ERROR_CAMERA_DISCONNECTED = -1
 
-latest_frames = {}     # tank_id -> np.ndarray
+latest_frames = {}
 
 frame_buffers = {}
 frame_locks = {}
-latest_jpeg = {}        # tank_id -> bytes
-jpeg_locks = {}         # tank_id -> Lock
 
-camera_status = {}        # tank_id -> bool (True if camera is streaming)
+latest_jpeg = {}
+jpeg_locks = {}
+
+camera_status = {}
 camera_status_lock = {}
 
 last_frame_time = {}
 last_frame_time_lock = {}
 
+
+# ---------------------------------------------------------
+# Initialize camera states
+# ---------------------------------------------------------
+
 def init_camera_state(camera_ids):
+
     for tank_id in camera_ids:
+
         frame_buffers[tank_id] = deque(maxlen=1)
         frame_locks[tank_id] = threading.Lock()
 
@@ -37,128 +50,159 @@ def init_camera_state(camera_ids):
         camera_status_lock[tank_id] = threading.Lock()
 
         last_frame_time[tank_id] = 0
-        last_frame_time_lock[tank_id] = threading.Lock()    
-
-def _read_full_frame(process):
-    raw = b""
-    while len(raw) < FRAME_SIZE:
-        chunk = process.stdout.read(FRAME_SIZE - len(raw))
-        if not chunk:
-            return None
-        raw += chunk
-    return raw
+        last_frame_time_lock[tank_id] = threading.Lock()
 
 
-def frame_reader(cam_id, process):
-    while True:
-        # print(f"[Camera {cam_id}] Frame received")
-        raw = _read_full_frame(process)
+# ---------------------------------------------------------
+# Capture exactly one frame from RTSP
+# ---------------------------------------------------------
 
-        if raw is None:
-            break
+def capture_one_frame(rtsp_url):
 
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-rtsp_transport", "tcp",
+         "-fflags", "nobuffer",       # <-- Reduces buffering/latency
+        "-flags", "low_delay",       # <-- Forces low delay decoding
+        "-analyzeduration", "100000",# <-- Stops probing stream format too long
+        "-probesize", "100000",      # <-- Limits initial data probe size
+        "-i", rtsp_url,
+        "-an",
+        "-sn",
+        "-dn",
+        "-frames:v", "1",
+        "-vf", f"scale={WIDTH}:{HEIGHT}",
+        "-pix_fmt", "bgr24",
+        "-f", "rawvideo",
+        "pipe:1"
+    ]
 
-        with frame_locks[cam_id]:
-            frame_buffers[cam_id].append(frame)
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=FFMPEG_TIMEOUT,
+        check=True
+    )
 
-        with camera_status_lock[cam_id]:
-            camera_status[cam_id] = True
+    raw = result.stdout
 
-        with last_frame_time_lock[cam_id]:
-            last_frame_time[cam_id] = time.time()
-
-def camera_worker(cam_id, rtsp_url):
-
-    while True:
-
-        print(f"[Camera {cam_id}] Starting FFmpeg")
-
-        cmd = [
-            "ffmpeg",
-            "-rtsp_transport", "tcp",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-an",
-            "-i", rtsp_url,
-            "-pix_fmt", "bgr24",
-            "-s", f"{WIDTH}x{HEIGHT}",
-            "-f", "rawvideo",
-            "-"
-        ]
-
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=10**8
+    if len(raw) != FRAME_SIZE:
+        raise RuntimeError(
+            f"Invalid frame size: {len(raw)} bytes"
         )
 
-        with last_frame_time_lock[cam_id]:
-            last_frame_time[cam_id] = time.time()
+    frame = np.frombuffer(
+        raw,
+        dtype=np.uint8
+    ).reshape((HEIGHT, WIDTH, 3))
 
-        with camera_status_lock[cam_id]:
-            camera_status[cam_id] = False
+    return frame.copy()
 
-        # start reader thread
-        t = threading.Thread(
-            target=frame_reader,
-            args=(cam_id, process),
-            daemon=True
-        )
-        t.start()
 
-        # # watchdog loop
-        while True:
+# ---------------------------------------------------------
+# Camera worker
+# ---------------------------------------------------------
 
-            time.sleep(1)
+def camera_worker(cam_id, rtsp_url, initial_delay=0):
+
+    print(
+        f"[Camera {cam_id}] Worker started. "
+        f"Initial delay: {initial_delay}s"
+    )
+
+    if initial_delay > 0:
+        time.sleep(initial_delay)
+
+    while True:
+
+        try:
+
+            print(f"[Camera {cam_id}] Capturing image...")
+
+            frame = capture_one_frame(rtsp_url)
+
+            # Store only the latest frame
+            with frame_locks[cam_id]:
+                frame_buffers[cam_id].append(frame)
+
+            # Update camera status
+            with camera_status_lock[cam_id]:
+                camera_status[cam_id] = True
 
             with last_frame_time_lock[cam_id]:
-                dt = time.time() - last_frame_time[cam_id]
+                last_frame_time[cam_id] = time.time()
 
-            # if (cam_id >= 4):
-            if dt > 30:
-                print(f"[Camera {cam_id}] timeout detected")
+            print(
+                f"[Camera {cam_id}] "
+                f"Capture successful"
+            )
 
-                with camera_status_lock[cam_id]:
-                    camera_status[cam_id] = False
+            # Wait until the next scheduled capture
+            time.sleep(CAPTURE_INTERVAL)
 
-                # modbus_queue.put((cam_id, ERROR_CAMERA_DISCONNECTED))
+        except subprocess.TimeoutExpired:
 
-                break
+            print(
+                f"[Camera {cam_id}] "
+                f"FFmpeg capture timeout"
+            )
 
-        # cleanup
-        try:
-            process.terminate()
-        except:
-            pass
+            with camera_status_lock[cam_id]:
+                camera_status[cam_id] = False
 
-        try:
-            process.kill()
-        except:
-            pass
+            time.sleep(RETRY_INTERVAL)
 
-        try:
-            process.stdout.close()
-        except:
-            pass
+        except subprocess.CalledProcessError as e:
 
-        print(f"[Camera {cam_id}] Reconnecting in 60 seconds")
-        time.sleep(60)
+            print(
+                f"[Camera {cam_id}] "
+                f"FFmpeg error: {e.stderr.decode(errors='replace')}"
+            )
+
+            with camera_status_lock[cam_id]:
+                camera_status[cam_id] = False
+
+            time.sleep(RETRY_INTERVAL)
+
+        except Exception as e:
+
+            print(
+                f"[Camera {cam_id}] "
+                f"Capture error: {e}"
+            )
+
+            with camera_status_lock[cam_id]:
+                camera_status[cam_id] = False
+
+            time.sleep(RETRY_INTERVAL)
+
+
+# ---------------------------------------------------------
+# Start all cameras
+# ---------------------------------------------------------
 
 def start_all_cameras(rtsp_urls, camera_ids):
-    if len(rtsp_urls) != len(camera_ids):
-        raise ValueError("Length of rtsp_urls and camera_ids must be the same.")
 
-    for cam_id, url in zip(camera_ids, rtsp_urls):
-        print(f"Starting camera {cam_id} with URL: {url}")
+    if len(rtsp_urls) != len(camera_ids):
+        raise ValueError(
+            "Length of rtsp_urls and camera_ids must be the same."
+        )
+
+    for index, (cam_id, url) in enumerate(
+        zip(camera_ids, rtsp_urls)
+    ):
+
+        initial_delay = index * CAMERA_START_OFFSET
+        print(
+            f"Starting camera {cam_id} "
+            f"with initial delay {initial_delay}s"
+        )
         t = threading.Thread(
             target=camera_worker,
-            args=(cam_id, url),
+            args=(cam_id, url, initial_delay),
             daemon=True
         )
         t.start()
-
-
-
-
