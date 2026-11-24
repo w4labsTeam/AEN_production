@@ -6,12 +6,19 @@ server:
 tanks:
   ids: [1, 2, 3, 4]
 
+# cameras:
+#   urls:
+#     - "rtsp://AENadmin:AENcamera123@192.168.0.61:554/12"
+#     - "rtsp://AENadmin:AENcamera123@192.168.0.62:554/11"
+#     - "rtsp://AENadmin:AENcamera123@192.168.0.63:554/12"
+#     - "rtsp://AENadmin:AENcamera123@192.168.0.64:554/12"
+
 cameras:
   urls:
-    - "rtsp://AENadmin:AENcamera123@192.168.0.61:554/12"
-    - "rtsp://AENadmin:AENcamera123@192.168.0.62:554/11"
-    - "rtsp://AENadmin:AENcamera123@192.168.0.63:554/12"
-    - "rtsp://AENadmin:AENcamera123@192.168.0.64:554/12"
+    - "rtsp://127.0.0.1:8554/tank1"
+    - "rtsp://127.0.0.1:8554/tank2"
+    - "rtsp://127.0.0.1:8554/tank3"
+    - "rtsp://127.0.0.1:8554/tank4"
 
 modbus:
   writer_url: "http://127.0.0.1:8002/write"
